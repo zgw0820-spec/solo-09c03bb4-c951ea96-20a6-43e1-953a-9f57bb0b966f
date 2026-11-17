@@ -95,6 +95,51 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 - 确认、查询、到期扫描都只做短事务，不等待网络。
 - 状态查询中的网关核对并发执行，最坏耗时约一次查询超时，而非逐条累加。
 
+### 7. 供电回路排查线索（改线与共同回路）
+
+值班员看到多个供电柜过热时，需要优先排查它们的**共同供电回路**。系统在原通知
+流程之外新增两类 API：柜号—回路改线 API，与回路排查线索 API。
+
+**归属在提交时固定，改线不重写旧证据**
+
+- 告警提交的同一事务内，按 `metadata.cabinet` 与当时的 `cabinet_circuits` 映射
+  解析回路，并把 `cabinet_no`、`circuit_no` 快照写入告警行；此后改线只更新当前映射
+  与只增不改的 `circuit_changes` 审计表，旧告警的回路与通知证据永不改变。
+- 缺 `metadata.cabinet`、或柜号尚无映射的告警，`circuit_no` 为 `null`，**照常走
+  主备通知**，只是不参与回路线索统计，并在 `warnings` 中明确提示。
+- 改线与告警提交交错时，每条告警固定的是“提交那一刻已提交（committed）”的映射；
+  线索查询在**一只读快照事务**内同时读取告警归属与改线审计，线索与归属始终来自
+  同一份一致的已提交状态。
+
+**线索判定：同回路、60 秒、至少两个不同柜**
+
+- 同一 `circuit_no` 下，任意 60 秒滑动窗口内出现**至少两个不同柜号**的告警，才形成
+  一条线索；返回回路、窗口起止时间，以及**逐柜的告警号列表**。
+- 单柜的重复报警不凑数：只有一个柜号的告警簇被直接过滤，绝不产生线索。
+- 同一告警号的幂等重试不会新增告警行，因此也不会重复计数。
+
+**改线后旧线索转为历史**
+
+- 任一参与线索的柜在其某条告警之后发生改线，该线索即从 `GET /circuit-clues`
+  （当前排查建议）消失，原样保留在 `GET /circuit-clues/history`，并标注退役原因与
+  改线时间；旧告警证据不变。即使之后又改回原回路，已退役的线索仍是历史（审计轨迹
+  保留了中间那次改线）。
+- 改线后该柜的**新**告警按新回路固定归属，参与新回路的线索判定。
+
+```bash
+# 建立映射（首次分配不算改线，不写审计表）
+curl -X PUT localhost:8000/cabinets/A07/circuit -H 'content-type: application/json' \
+  -d '{"circuit_no":"LOOP-A"}'
+curl -X PUT localhost:8000/cabinets/A08/circuit -H 'content-type: application/json' \
+  -d '{"circuit_no":"LOOP-A"}'
+# 两个不同柜在 60 秒内报警 -> 当前线索
+curl -s localhost:8000/circuit-clues | python3 -m json.tool
+# A08 改线到 LOOP-B：旧线索进入 history，新告警归属 LOOP-B
+curl -X PUT localhost:8000/cabinets/A08/circuit -H 'content-type: application/json' \
+  -d '{"circuit_no":"LOOP-B"}'
+curl -s localhost:8000/circuit-clues/history | python3 -m json.tool
+```
+
 ## 接口一览
 
 | 方法 | 路径 | 用途 |
@@ -105,6 +150,10 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 | GET | `/alarms/{alarm_no}/notifications` | 该告警的通知明细 |
 | GET | `/notifications/{notification_no}` | 按通知号查询网关受理结果 |
 | GET | `/alarms` | 列出告警，可按 `status` 过滤 |
+| PUT | `/cabinets/{cabinet_no}/circuit` | 改线：设置柜号当前归属的供电回路 |
+| GET | `/cabinets/circuit-mappings` | 列出当前全部柜号—回路映射 |
+| GET | `/circuit-clues` | 当前回路排查线索（60 秒内至少两个不同柜） |
+| GET | `/circuit-clues/history` | 因改线退役的历史线索（旧证据保留） |
 | GET | `/health` | 健康检查 |
 
 状态值：`primary_queued`、`primary_sending`、`primary_unconfirmed`、
@@ -179,14 +228,22 @@ curl -s localhost:8000/alarms/DEMO-2 | python3 -m json.tool
 ## 测试
 
 ```bash
-python -m pytest -q                     # 27 个测试，进程内假网关，真实 SQLite 文件
+python -m pytest -q                     # 原有 27 个 + 回路 10 个测试，进程内假网关，真实 SQLite 文件
 API_URL=http://localhost:8000 GATEWAY_URL=http://localhost:9000 \
-  python -I scripts/smoke_test.py       # 对真实运行的服务做端到端冒烟
+  python -I scripts/smoke_test.py       # 对真实运行的服务做端到端冒烟（含改线/线索）
 ```
 
 覆盖：幂等提交与 409、计时起点、确认阻断升级、逾期仅一次、回执不明不升级、
 回执补查不重复投递、重启接续（三种中断点）、确认 vs 到期竞态、慢投递不阻塞、
-拒收处理、在途备班如实披露、Swagger/OpenAPI。
+拒收处理、在途备班如实披露、Swagger/OpenAPI，以及**回路归属快照、60 秒窗口
+双柜判定、单柜重复不凑数、改线不重写旧证据、旧线索转历史、改线/提交交错一致性**。
+
+无第三方依赖环境（仅有 Python 标准库）下可用以下脚本验证同一套真实应用代码：
+
+```bash
+python -I scripts/verify_circuits_stdlib.py   # db/service/circuits 领域逻辑（40 项断言）
+python -I scripts/verify_http_stubs.py        # 路由、参数校验、序列化（24 项断言）
+```
 
 ## 已知限制
 

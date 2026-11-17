@@ -26,6 +26,7 @@ import json
 import secrets
 from typing import Any
 
+from .circuits import CLUE_WINDOW_SECONDS, build_clusters, is_retired, render_cluster
 from .db import Database, iso_from_real, parse_ts, utc_now
 from .view import build_alarm_view
 
@@ -40,6 +41,25 @@ class NotFoundError(Exception):
 
 class InvalidStateError(Exception):
     pass
+
+
+def _cabinet_from_metadata(metadata: Any) -> str | None:
+    """Extract ``metadata.cabinet``.
+
+    Only string or integer cabinet ids are recognised as mappable. A missing
+    cabinet (or an unusable type) yields None: such alarms still go through the
+    normal primary/backup notification path, they simply cannot be attached to a
+    circuit for clue derivation.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    cabinet = metadata.get("cabinet")
+    if isinstance(cabinet, str):
+        cabinet = cabinet.strip()
+        return cabinet or None
+    if isinstance(cabinet, int) and not isinstance(cabinet, bool):
+        return str(cabinet)
+    return None
 
 
 def _new_notification_no(alarm_no: str, role: str) -> str:
@@ -143,6 +163,7 @@ class AlarmService:
         content_hash = payload.content_hash()
         now = utc_now()
         now_real = parse_ts(now)
+        cabinet_no = _cabinet_from_metadata(payload.metadata)
 
         with self.db.transaction() as conn:
             existing = conn.execute(
@@ -155,12 +176,25 @@ class AlarmService:
                     )
                 return self._snapshot(conn, payload.alarm_no, now_real), True
 
+            # Ownership is resolved and snapshotted in the same transaction that
+            # creates the alarm, so the evidence always reflects a committed
+            # mapping state. A later rewiring never rewrites these two columns.
+            circuit_no = None
+            if cabinet_no is not None:
+                mapping = conn.execute(
+                    "SELECT circuit_no FROM cabinet_circuits WHERE cabinet_no = ?",
+                    (cabinet_no,),
+                ).fetchone()
+                if mapping is not None:
+                    circuit_no = mapping["circuit_no"]
+
             conn.execute(
                 """
                 INSERT INTO alarms (
                     alarm_no, content_hash, payload_json, primary_contact,
-                    backup_contact, ack_deadline_seconds, created_at, created_real
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    backup_contact, ack_deadline_seconds, created_at, created_real,
+                    cabinet_no, circuit_no
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload.alarm_no,
@@ -171,6 +205,8 @@ class AlarmService:
                     payload.ack_deadline_seconds,
                     now,
                     now_real,
+                    cabinet_no,
+                    circuit_no,
                 ),
             )
 
@@ -193,6 +229,27 @@ class AlarmService:
                 "submitted",
                 f"primary notification {primary['notification_no']}",
             )
+            if cabinet_no is None:
+                self._event(
+                    conn,
+                    payload.alarm_no,
+                    "cabinet_missing",
+                    "metadata.cabinet missing or unusable; normal notification only, no circuit clue",
+                )
+            elif circuit_no is None:
+                self._event(
+                    conn,
+                    payload.alarm_no,
+                    "cabinet_unmapped",
+                    f"cabinet {cabinet_no} has no circuit mapping; normal notification only, no circuit clue",
+                )
+            else:
+                self._event(
+                    conn,
+                    payload.alarm_no,
+                    "circuit_snapshotted",
+                    f"cabinet {cabinet_no} fixed to circuit {circuit_no} at submission",
+                )
             return self._snapshot(conn, payload.alarm_no, now_real), False
 
     # ----------------------------------------------------------------- confirm
@@ -519,6 +576,147 @@ class AlarmService:
             return dict(
                 conn.execute("SELECT * FROM notifications WHERE id = ?", (notification_id,)).fetchone()
             )
+
+    # ------------------------------------------------------------- snapshots
+    #
+    # The following section was the snapshot boundary; circuit ownership and
+    # clue APIs are defined just above it.
+
+    # ------------------------------------------------- cabinet rewiring/clues
+
+    def assign_cabinet_circuit(self, cabinet_no: str, circuit_no: str) -> dict[str, Any]:
+        """Assign (or rewire) a cabinet onto a power circuit.
+
+        Only the current mapping and the append-only audit table change. Alarm
+        rows keep their snapshotted ``circuit_no`` and their notification
+        evidence forever, so an old clue involving this cabinet is retired as
+        history rather than rewritten. A no-op assignment to the same circuit
+        changes nothing and records no audit row.
+        """
+        now = utc_now()
+        now_real = parse_ts(now)
+        with self.db.transaction() as conn:
+            existing = conn.execute(
+                "SELECT circuit_no FROM cabinet_circuits WHERE cabinet_no = ?",
+                (cabinet_no,),
+            ).fetchone()
+            old_circuit = existing["circuit_no"] if existing is not None else None
+            changed = old_circuit != circuit_no
+
+            if changed:
+                conn.execute(
+                    """
+                    INSERT INTO cabinet_circuits (cabinet_no, circuit_no, assigned_at, assigned_real)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(cabinet_no) DO UPDATE SET
+                        circuit_no = excluded.circuit_no,
+                        assigned_at = excluded.assigned_at,
+                        assigned_real = excluded.assigned_real
+                    """,
+                    (cabinet_no, circuit_no, now, now_real),
+                )
+                if old_circuit is not None:
+                    # The first assignment is not a rewiring: only moves between
+                    # two already-known circuits enter the audit trail that
+                    # retires clues.
+                    conn.execute(
+                        """
+                        INSERT INTO circuit_changes
+                            (cabinet_no, old_circuit_no, new_circuit_no, changed_at, changed_real)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (cabinet_no, old_circuit, circuit_no, now, now_real),
+                    )
+            return {
+                "cabinet_no": cabinet_no,
+                "circuit_no": circuit_no,
+                "previous_circuit_no": old_circuit,
+                "changed": changed,
+                "changed_at": now if changed else None,
+            }
+
+    def list_cabinet_circuits(self) -> list[dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT cabinet_no, circuit_no, assigned_at, assigned_real "
+            "FROM cabinet_circuits ORDER BY cabinet_no"
+        )
+        return [dict(row) for row in rows]
+
+    def circuit_clues(
+        self,
+        *,
+        history: bool,
+        window_seconds: float = CLUE_WINDOW_SECONDS,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Return current investigation clues (or retired historical clues).
+
+        The whole derivation runs inside one read-only deferred transaction, so
+        the alarm ownership and the rewiring audit rows always come from the
+        same committed state even when submissions and rewirings interleave.
+        """
+        with self.db.read_transaction() as conn:
+            alarm_rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT alarm_no, cabinet_no, circuit_no, created_at, created_real "
+                    "FROM alarms "
+                    "WHERE circuit_no IS NOT NULL AND cabinet_no IS NOT NULL "
+                    "ORDER BY circuit_no, created_real, alarm_no"
+                ).fetchall()
+            ]
+            change_rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT cabinet_no, changed_real FROM circuit_changes"
+                ).fetchall()
+            ]
+
+        rewired_at: dict[str, list[float]] = {}
+        for row in change_rows:
+            rewired_at.setdefault(row["cabinet_no"], []).append(row["changed_real"])
+
+        by_circuit: dict[str, list[dict[str, Any]]] = {}
+        for row in alarm_rows:
+            by_circuit.setdefault(row["circuit_no"], []).append(row)
+
+        clues: list[dict[str, Any]] = []
+        for circuit_no in sorted(by_circuit):
+            for cluster in build_clusters(by_circuit[circuit_no], window_seconds):
+                retired = is_retired(cluster, rewired_at)
+                if retired != history:
+                    continue
+                rendered = render_cluster(circuit_no, cluster, window_seconds)
+                if retired:
+                    # Name the earliest rewiring that retired the clue, once per
+                    # cabinet (a cabinet may contribute several alarms).
+                    reasons: dict[str, str] = {}
+                    for row in cluster:
+                        later = [t for t in rewired_at.get(row["cabinet_no"], ()) if t >= row["created_real"]]
+                        if later:
+                            stamp = iso_from_real(min(later))
+                            previous = reasons.get(row["cabinet_no"])
+                            if previous is None or stamp < previous:
+                                reasons[row["cabinet_no"]] = stamp
+                    rendered["archived"] = True
+                    rendered["archive_reason"] = "cabinet rewired after the contributing alarm(s)"
+                    rendered["rewirings"] = [
+                        {"cabinet_no": cabinet, "rewired_at": stamp}
+                        for cabinet, stamp in sorted(reasons.items(), key=lambda item: item[1])
+                    ]
+                else:
+                    rendered["archived"] = False
+                clues.append(rendered)
+
+        clues.sort(key=lambda item: (item["window_started_at"], item["circuit_no"]), reverse=True)
+        items = clues[:limit]
+        return {
+            "window_seconds": window_seconds,
+            "history": history,
+            "items": items,
+            "total": len(items),
+            "generated_at": utc_now(),
+        }
 
     # --------------------------------------------------------------- snapshot
 

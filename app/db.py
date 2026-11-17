@@ -95,6 +95,35 @@ CREATE TABLE IF NOT EXISTS events (
     kind        TEXT NOT NULL,
     detail      TEXT
 );
+
+-- Current cabinet -> power-circuit ownership. The mapping is mutable via the
+-- rewiring API, but only this table changes: every alarm keeps the ownership it
+-- had at submission time in alarms.cabinet / alarms.circuit_no.
+CREATE TABLE IF NOT EXISTS cabinet_circuits (
+    cabinet_no     TEXT PRIMARY KEY,
+    circuit_no     TEXT NOT NULL,
+    assigned_at    TEXT NOT NULL,
+    assigned_real  REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_cabinet_circuits_circuit
+    ON cabinet_circuits(circuit_no);
+
+-- Append-only rewiring audit trail. Only actual rewirings (a cabinet moving
+-- from one known circuit to another) are recorded; the first assignment of a
+-- cabinet is not a rewiring and never appears here. These rows are the evidence
+-- used to retire stale investigation clues as history.
+CREATE TABLE IF NOT EXISTS circuit_changes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cabinet_no      TEXT NOT NULL,
+    old_circuit_no  TEXT NOT NULL,
+    new_circuit_no  TEXT NOT NULL,
+    changed_at      TEXT NOT NULL,
+    changed_real    REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_circuit_changes_cabinet
+    ON circuit_changes(cabinet_no, changed_real);
 """
 
 
@@ -127,11 +156,45 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE notifications ADD COLUMN lookup_misses INTEGER NOT NULL DEFAULT 0"
             )
+        alarm_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(alarms)").fetchall()
+        }
+        # Ownership is snapshotted at submission time, so it lives on the alarm
+        # row itself and is never rewritten by later rewirings.
+        if "cabinet_no" not in alarm_columns:
+            self._conn.execute("ALTER TABLE alarms ADD COLUMN cabinet_no TEXT")
+        if "circuit_no" not in alarm_columns:
+            self._conn.execute("ALTER TABLE alarms ADD COLUMN circuit_no TEXT")
+        if "ix_alarms_circuit" not in {
+            row["name"] for row in self._conn.execute("PRAGMA index_list(alarms)").fetchall()
+        }:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_alarms_circuit ON alarms(circuit_no, created_real)"
+            )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            else:
+                self._conn.execute("COMMIT")
+
+    @contextmanager
+    def read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """A read-only deferred transaction: one consistent committed snapshot.
+
+        It never acquires a write lock, so clue queries cannot block alarm
+        submissions or rewirings, while every statement inside still sees the
+        same committed state (single-process SQLite, WAL mode).
+        """
+        with self._lock:
+            self._conn.execute("BEGIN")
             try:
                 yield self._conn
             except BaseException:

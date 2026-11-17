@@ -140,6 +140,52 @@ def main() -> int:
     status, single = call("GET", f"{API}/notifications/{notification_no}")
     check(status == 200 and single["notification_no"] == notification_no, "lookup by notification number")
 
+    print("[6] circuit rewiring and investigation clues")
+    # Two different cabinets on the same loop, within the 60 s window.
+    c1, c2 = f"{RUN}-CAB-1", f"{RUN}-CAB-2"
+    status, mapping = call("PUT", f"{API}/cabinets/{c1}/circuit", {"circuit_no": "LOOP-X"})
+    check(status == 200 and mapping["changed"] is True, "first cabinet mapping created")
+    status, _ = call("PUT", f"{API}/cabinets/{c2}/circuit", {"circuit_no": "LOOP-X"})
+    check(status == 200, "second cabinet mapping created")
+
+    def cab_payload(alarm_no: str, cabinet: str) -> dict:
+        body = payload(alarm_no, 3)
+        body["metadata"] = {"cabinet": cabinet}
+        return body
+
+    call("POST", f"{API}/alarms", cab_payload(f"{RUN}-CIR-1", c1))
+    call("POST", f"{API}/alarms", cab_payload(f"{RUN}-CIR-2", c2))
+    status, clue_list = call("GET", f"{API}/circuit-clues")
+    check(status == 200 and clue_list["total"] >= 1, "current circuit clue produced")
+    x_clues = [c for c in clue_list["items"] if c["circuit_no"] == "LOOP-X"]
+    check(len(x_clues) == 1 and x_clues[0]["cabinet_count"] == 2,
+          "clue spans two distinct cabinets with per-cabinet alarm numbers")
+
+    # One cabinet repeating alone must not add a clue by itself.
+    call("POST", f"{API}/alarms", cab_payload(f"{RUN}-SOLO", f"{RUN}-OTHER"))
+    status, no_map = call("GET", f"{API}/circuit-clues")
+    check(
+        all(c["circuit_no"] != "LOOP-SOLO" for c in no_map["items"]),
+        "unmapped single-cabinet alarm creates no clue",
+    )
+
+    # Rewire the second cabinet away: evidence immutable, clue moves to history.
+    status, rewire = call("PUT", f"{API}/cabinets/{c2}/circuit", {"circuit_no": "LOOP-Y"})
+    check(status == 200 and rewire["previous_circuit_no"] == "LOOP-X", "rewiring accepted")
+    status, old = call("GET", f"{API}/alarms/{RUN}-CIR-2")
+    check(old["circuit_no"] == "LOOP-X", "old alarm evidence not rewritten by rewiring")
+    status, current = call("GET", f"{API}/circuit-clues")
+    check(all(c["circuit_no"] != "LOOP-X" for c in current["items"]),
+          "retired clue no longer a current suggestion")
+    status, history = call("GET", f"{API}/circuit-clues/history")
+    archived = [c for c in history["items"] if c["circuit_no"] == "LOOP-X"]
+    check(len(archived) == 1 and archived[0]["archived"] is True,
+          "old clue retained as history with the rewiring reason")
+
+    status, mappings = call("GET", f"{API}/cabinets/circuit-mappings")
+    lookup = {row["cabinet_no"]: row["circuit_no"] for row in mappings}
+    check(lookup[c1] == "LOOP-X" and lookup[c2] == "LOOP-Y", "mapping table shows current ownership")
+
     print("smoke test passed")
     return 0
 

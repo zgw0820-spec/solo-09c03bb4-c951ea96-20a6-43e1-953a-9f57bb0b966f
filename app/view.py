@@ -138,6 +138,12 @@ def build_alarm_view(
         warnings.append("告警已确认，排队中的备班通知未投递即取消。")
     if backup is not None and backup["state"] == "failed":
         warnings.append("网关拒收备班通知，升级投递失败，需人工通知备班。")
+    if alarm.get("cabinet_no") is None:
+        warnings.append("告警缺少可用的 metadata.cabinet，不参与回路线索统计；主备通知照常投递。")
+    elif alarm.get("circuit_no") is None:
+        warnings.append(
+            f"柜号 {alarm.get('cabinet_no')} 当前无供电回路映射，不参与回路线索统计；主备通知照常投递。"
+        )
 
     seconds_until: float | None = None
     if (
@@ -171,4 +177,7 @@ def build_alarm_view(
         "events": events,
         "warnings": warnings,
         "deduplicated": False,
+        # Ownership fixed at submission time; never rewritten by a later rewiring.
+        "cabinet_no": alarm.get("cabinet_no"),
+        "circuit_no": alarm.get("circuit_no"),
     }

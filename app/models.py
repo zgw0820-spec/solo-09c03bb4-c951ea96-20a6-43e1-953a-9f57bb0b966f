@@ -130,6 +130,74 @@ class AlarmView(BaseModel):
     events: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     deduplicated: bool = Field(default=False, description="True when a retry reused an existing alarm")
+    cabinet_no: str | None = Field(
+        default=None, description="Cabinet id taken from metadata.cabinet at submission time"
+    )
+    circuit_no: str | None = Field(
+        default=None,
+        description="Power circuit fixed at submission time; null when the cabinet had no mapping",
+    )
+
+
+class CircuitAssignmentRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"example": {"circuit_no": "LOOP-B"}},
+    )
+
+    circuit_no: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+        description="Target power circuit for the cabinet",
+    )
+
+
+class CircuitAssignmentView(BaseModel):
+    cabinet_no: str
+    circuit_no: str
+    previous_circuit_no: str | None = Field(
+        default=None, description="Circuit before this call; null for the first assignment"
+    )
+    changed: bool = Field(description="False when the cabinet was already on that circuit (no-op)")
+    changed_at: str | None = None
+
+
+class CabinetCircuitView(BaseModel):
+    cabinet_no: str
+    circuit_no: str
+    assigned_at: str
+    assigned_real: float
+
+
+class CircuitClueCabinet(BaseModel):
+    cabinet_no: str
+    alarm_nos: list[str]
+    alarm_count: int
+
+
+class CircuitClueView(BaseModel):
+    circuit_no: str
+    window_seconds: float
+    window_started_at: str
+    window_ended_at: str
+    cabinet_count: int = Field(description="Distinct cabinets in the window; always >= 2 for a clue")
+    alarm_count: int
+    cabinets: list[CircuitClueCabinet] = Field(
+        description="Per-cabinet alarm numbers for the investigation"
+    )
+    alarm_nos: list[str]
+    archived: bool = Field(description="True only on the history endpoint")
+    archive_reason: str | None = None
+    rewirings: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class CircuitClueList(BaseModel):
+    window_seconds: float
+    history: bool
+    items: list[CircuitClueView]
+    total: int
+    generated_at: str
 
 
 class NotificationList(BaseModel):

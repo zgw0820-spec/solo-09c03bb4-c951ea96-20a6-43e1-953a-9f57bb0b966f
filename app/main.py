@@ -17,6 +17,10 @@ from .gateway_client import GatewayClient
 from .models import (
     AlarmCreate,
     AlarmView,
+    CabinetCircuitView,
+    CircuitAssignmentRequest,
+    CircuitAssignmentView,
+    CircuitClueList,
     ConfirmRequest,
     HealthView,
     NotificationList,
@@ -86,7 +90,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "- 主通知只有拿到网关的受理确认才开始计时；回执不明标记为 "
             "`receipt_unconfirmed`，查明前绝不触发升级。\n"
             "- 通知号是网关幂等键；API 重启后按数据库中的待办继续投递/查询。\n"
-            "- 确认与到期处理并发时，确认优先且不新建备班投递；已在途通知通过网关查询后如实显示。"
+            "- 确认与到期处理并发时，确认优先且不新建备班投递；已在途通知通过网关查询后如实显示。\n\n"
+            "**供电回路排查**\n"
+            "- 告警提交时按 `metadata.cabinet` 与当时的柜号—回路映射固定回路归属，改线不重写旧证据。\n"
+            "- 同一回路任意 60 秒内至少两个不同柜报警才形成排查线索（`GET /circuit-clues`），逐柜返回告警号；单柜重复不凑数。\n"
+            "- 改线 API 为 `PUT /cabinets/{cabinet_no}/circuit`；涉及改线柜的旧线索保留在 `/circuit-clues/history`。\n"
+            "- 缺柜号或无映射的告警不参与线索统计，主备通知流程不受影响。"
         ),
         lifespan=lifespan,
     )
@@ -251,6 +260,81 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if status_filter:
             views = [v for v in views if v["status"] == status_filter]
         return {"items": views, "total": len(views)}
+
+    # --------------------------------------------- cabinet / circuit ownership
+
+    @app.put(
+        "/cabinets/{cabinet_no}/circuit",
+        response_model=CircuitAssignmentView,
+        tags=["供电回路"],
+        summary="改线：指定柜号当前归属的供电回路",
+        description=(
+            "更新柜号到供电回路的当前映射，并追加一条只增不改的改线审计记录。"
+            "**改线不会改写任何旧告警**：旧告警保留提交时固定的回路与通知证据；"
+            "涉及该柜的旧线索转为历史线索，不再出现在当前排查建议中。"
+            "柜号与回路号允许字母、数字及 `._:-`。"
+        ),
+    )
+    def assign_cabinet_circuit(
+        cabinet_no: str, payload: CircuitAssignmentRequest, request: Request
+    ) -> CircuitAssignmentView:
+        service: AlarmService = request.app.state.service
+        return CircuitAssignmentView(
+            **service.assign_cabinet_circuit(cabinet_no, payload.circuit_no)
+        )
+
+    @app.get(
+        "/cabinets/circuit-mappings",
+        response_model=list[CabinetCircuitView],
+        tags=["供电回路"],
+        summary="列出当前全部柜号—回路映射",
+    )
+    def list_cabinet_circuits(request: Request) -> list[CabinetCircuitView]:
+        service: AlarmService = request.app.state.service
+        return [CabinetCircuitView(**row) for row in service.list_cabinet_circuits()]
+
+    @app.get(
+        "/circuit-clues",
+        response_model=CircuitClueList,
+        tags=["供电回路"],
+        summary="当前回路排查线索",
+        description=(
+            "同一供电回路上，任意 60 秒滑动窗口内出现**至少两个不同柜号**的过热告警，"
+            "才形成一条线索，并逐柜给出告警号。单柜重复报警不凑数。"
+            "告警的回路归属在提交时按当时映射固定；改线后涉及改线柜的旧线索转为历史，"
+            "不在本接口返回（见 `/circuit-clues/history`）。整个查询在同一只读快照事务内完成，"
+            "线索与归属始终来自一致的已提交状态。"
+        ),
+    )
+    def current_circuit_clues(
+        request: Request,
+        window_seconds: float = Query(default=60.0, ge=1.0, le=3600.0),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> CircuitClueList:
+        service: AlarmService = request.app.state.service
+        return CircuitClueList(
+            **service.circuit_clues(history=False, window_seconds=window_seconds, limit=limit)
+        )
+
+    @app.get(
+        "/circuit-clues/history",
+        response_model=CircuitClueList,
+        tags=["供电回路"],
+        summary="历史回路线索（改线后保留的排查证据）",
+        description=(
+            "返回因柜号改线而退役的旧线索：旧告警证据保持不变，仅标注为历史并附改线时间，"
+            "不再作为当前排查建议。"
+        ),
+    )
+    def historical_circuit_clues(
+        request: Request,
+        window_seconds: float = Query(default=60.0, ge=1.0, le=3600.0),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> CircuitClueList:
+        service: AlarmService = request.app.state.service
+        return CircuitClueList(
+            **service.circuit_clues(history=True, window_seconds=window_seconds, limit=limit)
+        )
 
     return app
 
